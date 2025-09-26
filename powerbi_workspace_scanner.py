@@ -273,6 +273,28 @@ class PowerBIScanner:
             self.logger.warning(f"Could not get users for workspace {workspace_id}: {str(e)}")
             return []
 
+    def get_reports_regular_api(self) -> List[Dict]:
+        """Get all reports using regular API (non-admin) - captures reports shared with user"""
+        try:
+            url = f"{self.base_url}/reports"
+            response = self._make_request(url)
+            reports = response.get('value', [])
+            self.logger.info(f"Found {len(reports)} reports via regular API")
+            return reports
+        except Exception as e:
+            self.logger.error(f"Failed to get reports via regular API: {str(e)}")
+            return []
+
+    def get_reports_for_workspace(self, workspace_id: str) -> List[Dict]:
+        """Get reports for a specific workspace"""
+        try:
+            url = f"{self.base_url}/groups/{workspace_id}/reports"
+            response = self._make_request(url)
+            return response.get('value', [])
+        except Exception as e:
+            self.logger.warning(f"Failed to get reports for workspace {workspace_id}: {str(e)}")
+            return []
+
     def process_workspace_data(self, scan_results: Dict) -> List[Dict]:
         """
         Process scan results and extract structured data
@@ -414,70 +436,212 @@ class PowerBIScanner:
 
     def scan_all_workspaces(self, use_admin_api: bool = True, batch_size: int = 100) -> List[Dict]:
         """
-        Main method to scan all workspaces and return structured data
+        Enhanced multi-method scan to capture all reports using multiple discovery approaches
 
         Args:
             use_admin_api: Whether to use admin API for comprehensive scan
             batch_size: Number of workspaces to process per batch
 
         Returns:
-            List of processed workspace/report records
+            List of processed workspace/report records with enhanced data
         """
-        all_data = []
+        all_reports = {}
+        all_workspaces = {}
 
         try:
+            self.logger.info("🔍 Starting enhanced multi-method workspace scan...")
+
+            # Method 1: Regular API for reports accessible to user
+            self.logger.info("📊 Method 1: Scanning via Regular Reports API...")
+            regular_reports = self.get_reports_regular_api()
+
+            for report in regular_reports:
+                report_id = report.get('id')
+                if report_id:
+                    report['discovery_method'] = 'regular_api'
+                    all_reports[report_id] = report
+
+            # Method 2: Get all workspaces and scan each individually
+            self.logger.info("📁 Method 2: Scanning workspaces individually...")
+            workspaces = self.get_all_workspaces()
+            self.logger.info(f"Found {len(workspaces)} workspaces")
+
+            for workspace in workspaces:
+                ws_id = workspace.get('id')
+                ws_name = workspace.get('name', 'Unknown')
+                all_workspaces[ws_id] = workspace
+
+                # Get reports for this workspace
+                ws_reports = self.get_reports_for_workspace(ws_id)
+
+                for report in ws_reports:
+                    report_id = report.get('id')
+                    if report_id:
+                        if report_id in all_reports:
+                            # Enhance existing report with workspace info
+                            all_reports[report_id]['workspace_name'] = ws_name
+                            all_reports[report_id]['workspace_id'] = ws_id
+                        else:
+                            report['discovery_method'] = 'workspace_api'
+                            report['workspace_name'] = ws_name
+                            report['workspace_id'] = ws_id
+                            all_reports[report_id] = report
+
+            # Method 3: Admin API scan (if available and enabled)
             if use_admin_api:
-                self.logger.info("Using Admin API for comprehensive workspace scan...")
+                self.logger.info("🔒 Method 3: Admin API comprehensive scan...")
+                try:
+                    workspace_ids = list(all_workspaces.keys())
 
-                # Get all workspace IDs first
-                workspaces = self.get_all_workspaces()
-                workspace_ids = [ws.get('id') for ws in workspaces if ws.get('id')]
+                    # Process in batches
+                    for i in range(0, len(workspace_ids), batch_size):
+                        batch_ids = workspace_ids[i:i + batch_size]
+                        self.logger.info(f"Processing admin scan batch {i // batch_size + 1}: {len(batch_ids)} workspaces")
 
-                if not workspace_ids:
-                    self.logger.warning("No workspaces found or insufficient permissions")
-                    return []
+                        scan_id = self.trigger_workspace_scan(batch_ids)
 
-                # Process in batches
-                for i in range(0, len(workspace_ids), batch_size):
-                    batch_ids = workspace_ids[i:i + batch_size]
-                    self.logger.info(f"Processing batch {i // batch_size + 1}: {len(batch_ids)} workspaces")
+                        if self.wait_for_scan_completion(scan_id):
+                            scan_results = self.get_scan_result(scan_id)
 
-                    # Trigger scan for this batch
-                    scan_id = self.trigger_workspace_scan(batch_ids)
+                            for workspace in scan_results.get('workspaces', []):
+                                ws_id = workspace.get('id')
+                                ws_name = workspace.get('name', 'Unknown')
 
-                    # Wait for completion
-                    if self.wait_for_scan_completion(scan_id):
-                        # Get and process results
-                        scan_results = self.get_scan_result(scan_id)
-                        batch_data = self.process_workspace_data(scan_results)
-                        all_data.extend(batch_data)
-                        self.logger.info(f"Processed {len(batch_data)} records from batch")
-                    else:
-                        self.logger.error(f"Scan failed for batch {i // batch_size + 1}")
+                                # Get workspace users/permissions for enhanced data
+                                workspace_users = workspace.get('users', [])
 
-            else:
-                self.logger.info("Using regular API (limited data available)...")
-                workspaces = self.get_all_workspaces()
+                                for report in workspace.get('reports', []):
+                                    report_id = report.get('id')
 
-                for workspace in workspaces:
-                    workspace_info = {
-                        'Workspace Name': workspace.get('name', ''),
-                        'Workspace Owner': workspace.get('createdBy', ''),  # Limited info
-                        'Workspace ID': workspace.get('id', ''),
-                        'Workspace Permissions': 'Limited access - Admin API required',
-                        'Linked Service Principals': 'Limited access - Admin API required',
-                        'Report Names': 'Limited access - Admin API required',
-                        'Report IDs': 'Limited access - Admin API required',
-                        'Report Owner': 'Limited access - Admin API required',
-                        'Report Permissions': 'Limited access - Admin API required'
-                    }
-                    all_data.append(workspace_info)
+                                    if report_id:
+                                        if report_id in all_reports:
+                                            # Enhance existing report with admin data
+                                            all_reports[report_id].update({
+                                                'admin_data': True,
+                                                'users': report.get('users', []),
+                                                'createdBy': report.get('createdBy'),
+                                                'modifiedBy': report.get('modifiedBy'),
+                                                'createdDateTime': report.get('createdDateTime'),
+                                                'modifiedDateTime': report.get('modifiedDateTime'),
+                                                'workspace_users': workspace_users
+                                            })
+                                        else:
+                                            # New report found only in admin scan
+                                            report['discovery_method'] = 'admin_api'
+                                            report['workspace_id'] = ws_id
+                                            report['workspace_name'] = ws_name
+                                            report['workspace_users'] = workspace_users
+                                            all_reports[report_id] = report
+
+                        else:
+                            self.logger.error(f"Admin scan failed for batch {i // batch_size + 1}")
+
+                except Exception as e:
+                    self.logger.error(f"Admin API scan error: {str(e)}")
+
+            # Convert to structured export format
+            self.logger.info("📋 Processing results into structured format...")
+            structured_data = self._convert_reports_to_structured_data(list(all_reports.values()), all_workspaces)
+
+            self.logger.info(f"✅ Enhanced scan complete:")
+            self.logger.info(f"   - Total unique reports: {len(all_reports)}")
+            self.logger.info(f"   - Total workspaces: {len(all_workspaces)}")
+
+            # Log discovery method breakdown
+            method_counts = {}
+            for report in all_reports.values():
+                method = report.get('discovery_method', 'unknown')
+                method_counts[method] = method_counts.get(method, 0) + 1
+
+            for method, count in method_counts.items():
+                self.logger.info(f"   - {method}: {count} reports")
+
+            return structured_data
 
         except Exception as e:
-            self.logger.error(f"Error during workspace scan: {str(e)}")
+            self.logger.error(f"Error during enhanced workspace scan: {str(e)}")
             raise
 
-        return all_data
+    def _convert_reports_to_structured_data(self, all_reports: List[Dict], all_workspaces: Dict) -> List[Dict]:
+        """
+        Convert enhanced report data to structured format for export
+
+        Args:
+            all_reports: List of all reports with enhanced data
+            all_workspaces: Dictionary of all workspaces
+
+        Returns:
+            List of structured records for export
+        """
+        structured_data = []
+
+        for report in all_reports:
+            # Get workspace info
+            ws_id = report.get('workspace_id', '')
+            ws_name = report.get('workspace_name', '')
+
+            # Get workspace details from workspace dict
+            workspace_info = all_workspaces.get(ws_id, {})
+            workspace_users = report.get('workspace_users', [])
+
+            # Process workspace permissions and owner
+            workspace_permissions = []
+            workspace_owner = ''
+            service_principals = []
+
+            for user in workspace_users:
+                user_type = user.get('principalType', 'User')
+                identifier = user.get('emailAddress', user.get('identifier', ''))
+                access_right = user.get('accessRight', '')
+
+                if identifier and access_right:
+                    if user_type == 'App' or 'service' in identifier.lower():
+                        service_principals.append(f"{identifier} ({access_right})")
+
+                    permission_str = f"{identifier} ({access_right})"
+                    workspace_permissions.append(permission_str)
+
+                    if access_right == 'Admin' and not workspace_owner:
+                        workspace_owner = identifier
+
+            # Process report permissions and owner
+            report_users = report.get('users', [])
+            report_permissions = []
+            report_owner = report.get('createdBy', '')
+
+            for user in report_users:
+                identifier = user.get('emailAddress', user.get('identifier', ''))
+                access_right = user.get('accessRight', '')
+
+                if identifier and access_right:
+                    permission_str = f"{identifier} ({access_right})"
+                    report_permissions.append(permission_str)
+
+                    if access_right in ['Owner', 'Admin'] and not report_owner:
+                        report_owner = identifier
+
+            # Create structured record
+            structured_record = {
+                'Workspace Name': ws_name,
+                'Workspace Owner': workspace_owner,
+                'Workspace ID': ws_id,
+                'Workspace Permissions': '; '.join(workspace_permissions),
+                'Report Names': report.get('name', ''),
+                'Report IDs': report.get('id', ''),
+                'Report Owner': report_owner,
+                'Report Permissions': '; '.join(report_permissions),
+                'Linked Service Principals': '; '.join(service_principals),
+                'Discovery Method': report.get('discovery_method', ''),
+                'Created Date': report.get('createdDateTime', ''),
+                'Modified Date': report.get('modifiedDateTime', ''),
+                'Modified By': report.get('modifiedBy', ''),
+                'Web URL': report.get('webUrl', ''),
+                'Embed URL': report.get('embedUrl', '')
+            }
+
+            structured_data.append(structured_record)
+
+        return structured_data
 
     def export_to_files(self, data: List[Dict], output_prefix: str = "powerbi_workspace_scan") -> Dict[str, str]:
         """
@@ -500,11 +664,12 @@ class PowerBIScanner:
             # Create DataFrame
             df = pd.DataFrame(data)
 
-            # Reorder columns to match requested format
+            # Reorder columns - original columns plus enhanced data
             column_order = [
                 'Workspace Name', 'Workspace Owner', 'Workspace ID', 'Workspace Permissions',
                 'Report Names', 'Report IDs', 'Report Owner', 'Report Permissions',
-                'Linked Service Principals'
+                'Linked Service Principals', 'Discovery Method', 'Created Date',
+                'Modified Date', 'Modified By', 'Web URL', 'Embed URL'
             ]
 
             # Only include columns that exist in the data
